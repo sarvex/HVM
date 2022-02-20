@@ -205,6 +205,9 @@ fn compile_func_rule_term(
           panic!("Unbound variable.");
         }
       }
+      bd::DynTerm::Glo { .. } => {
+        panic!("TODO");
+      }
       bd::DynTerm::Dup { eras, expr, body } => {
         //if INLINE_NUMBERS {
         //line(code, tab + 0, &format!("if (get_tag({}) == U32 && get_tag({}) == U32) {{", val0, val1));
@@ -256,7 +259,7 @@ fn compile_func_rule_term(
         vars.pop();
         body
       }
-      bd::DynTerm::Lam { eras, body } => {
+      bd::DynTerm::Lam { eras, glob: _, body } => {
         let name = fresh(nams, "lam");
         line(code, tab, &format!("u64 {} = alloc(mem, 2);", name));
         vars.push(format!("Var({})", name));

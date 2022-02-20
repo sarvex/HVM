@@ -7,13 +7,15 @@ use crate::rulebook as rb;
 use crate::runtime as rt;
 use std::iter;
 use std::time::Instant;
+use std::collections::{HashMap};
 
 #[derive(Debug)]
 pub enum DynTerm {
   Var { bidx: u64 },
+  Glo { name: String },
   Dup { eras: (bool, bool), expr: Box<DynTerm>, body: Box<DynTerm> },
   Let { expr: Box<DynTerm>, body: Box<DynTerm> },
-  Lam { eras: bool, body: Box<DynTerm> },
+  Lam { eras: bool, glob: Option<String>, body: Box<DynTerm> },
   App { func: Box<DynTerm>, argm: Box<DynTerm> },
   Cal { func: u64, args: Vec<DynTerm> },
   Ctr { func: u64, args: Vec<DynTerm> },
@@ -31,7 +33,7 @@ pub type Node = Vec<Elem>; // A node on the pre-filled body
 #[derive(Copy, Clone, Debug)]
 pub enum Elem {
   // An element of a node
-  Fix { value: u64 }, // Fixed value, doesn't require adjuemtn
+  Fix { value: u64 }, // Fixed value, doesn't require adjustment
   Loc { value: u64, targ: u64, slot: u64 }, // Local link, requires adjustment
   Ext { index: u64 }, // Link to an external variable
 }
@@ -281,14 +283,12 @@ fn term_to_dynterm(comp: &rb::RuleBook, term: &lang::Term, free_vars: u64) -> Dy
     vars: &mut Vec<String>,
   ) -> DynTerm {
     match term {
-      lang::Term::Var { name } => DynTerm::Var {
-        bidx: vars
-          .iter()
-          .enumerate()
-          .rev()
-          .find(|(_, var)| var == &name)
-          .unwrap_or_else(|| panic!("Unbound variable: '{}'.", name))
-          .0 as u64,
+      lang::Term::Var { name } => {
+        if let Some((idx,_)) = vars.iter().enumerate().rev().find(|(_, var)| var == &name) {
+          DynTerm::Var{ bidx: idx as u64 }
+        } else {
+          DynTerm::Glo{ name: name.clone() }
+        }
       },
       lang::Term::Dup { nam0, nam1, expr, body } => {
         let eras = (nam0 == "*", nam1 == "*");
@@ -301,11 +301,12 @@ fn term_to_dynterm(comp: &rb::RuleBook, term: &lang::Term, free_vars: u64) -> Dy
         DynTerm::Dup { eras, expr, body }
       }
       lang::Term::Lam { name, body } => {
+        let glob = if rb::is_global_name(&name) { Some(name.clone()) } else { None };
         let eras = name == "*";
         vars.push(name.clone());
         let body = Box::new(convert_term(body, comp, depth + 1, vars));
         vars.pop();
-        DynTerm::Lam { eras, body }
+        DynTerm::Lam { eras, glob, body }
       }
       lang::Term::Let { name, expr, body } => {
         let expr = Box::new(convert_term(expr, comp, depth + 0, vars));
@@ -344,112 +345,167 @@ fn term_to_dynterm(comp: &rb::RuleBook, term: &lang::Term, free_vars: u64) -> Dy
 }
 
 fn build_body(term: &DynTerm, free_vars: u64) -> Body {
-  fn link(nodes: &mut Vec<Node>, targ: u64, slot: u64, elem: Elem) {
-    nodes[targ as usize][slot as usize] = elem;
-    if let Elem::Loc { value, targ: var_targ, slot: var_slot } = elem {
+  #[derive(Clone, Debug)]
+  enum PreElem {
+    Fix { value: u64 },
+    Loc { value: u64, targ: u64, slot: u64 },
+    Ext { index: u64 },
+    Glo { name: String },
+  }
+  type PreNode = Vec<PreElem>;
+  fn link(nodes: &mut Vec<PreNode>, targ: u64, slot: u64, elem: PreElem) {
+    nodes[targ as usize][slot as usize] = elem.clone();
+    if let PreElem::Loc { value, targ: var_targ, slot: var_slot } = elem {
       let tag = rt::get_tag(value);
       if tag <= rt::VAR {
-        nodes[var_targ as usize][(var_slot + (tag & 0x01)) as usize] =
-          Elem::Loc { value: rt::Arg(0), targ, slot };
+        nodes[var_targ as usize][(var_slot + (tag & 0x01)) as usize] = PreElem::Loc { value: rt::Arg(0), targ, slot };
       }
     }
   }
-  fn go(
+  fn gen_elem(
     term: &DynTerm,
-    vars: &mut Vec<Elem>,
-    nodes: &mut Vec<Node>,
-  ) -> Elem {
+    glob: &mut HashMap<String, PreElem>,
+    vars: &mut Vec<PreElem>,
+    nodes: &mut Vec<PreNode>,
+  ) -> PreElem {
     match term {
       DynTerm::Var { bidx } => {
         if *bidx < vars.len() as u64 {
-          vars[*bidx as usize]
+          vars[*bidx as usize].clone()
         } else {
           panic!("Unbound variable.");
         }
       }
+      DynTerm::Glo { name } => {
+        PreElem::Glo {
+          name: name.clone()
+        }
+      }
       DynTerm::Dup { eras: _, expr, body } => {
         let targ = nodes.len() as u64;
-        nodes.push(vec![Elem::Fix { value: 0 }; 3]);
+        nodes.push(vec![PreElem::Fix { value: 0 }; 3]);
         //let dupk = dups_count.next();
-        link(nodes, targ, 0, Elem::Fix { value: rt::Era() });
-        link(nodes, targ, 1, Elem::Fix { value: rt::Era() });
-        let expr = go(expr, vars, nodes);
+        link(nodes, targ, 0, PreElem::Fix { value: rt::Era() });
+        link(nodes, targ, 1, PreElem::Fix { value: rt::Era() });
+        let expr = gen_elem(expr, glob, vars, nodes);
         link(nodes, targ, 2, expr);
-        vars.push(Elem::Loc { value: rt::Dp0(0, 0), targ, slot: 0 });
-        vars.push(Elem::Loc { value: rt::Dp1(0, 0), targ, slot: 0 });
-        let body = go(body, vars, nodes);
+        vars.push(PreElem::Loc { value: rt::Dp0(0, 0), targ, slot: 0 });
+        vars.push(PreElem::Loc { value: rt::Dp1(0, 0), targ, slot: 0 });
+        let body = gen_elem(body, glob, vars, nodes);
         vars.pop();
         vars.pop();
         body
       }
       DynTerm::Let { expr, body } => {
-        let expr = go(expr, vars, nodes);
+        let expr = gen_elem(expr, glob, vars, nodes);
         vars.push(expr);
-        let body = go(body, vars, nodes);
+        let body = gen_elem(body, glob, vars, nodes);
         vars.pop();
         body
       }
-      DynTerm::Lam { eras: _, body } => {
+      DynTerm::Lam { eras: _, glob: glob_name, body } => {
         let targ = nodes.len() as u64;
-        nodes.push(vec![Elem::Fix { value: 0 }; 2]);
-        link(nodes, targ, 0, Elem::Fix { value: rt::Era() });
-        vars.push(Elem::Loc { value: rt::Var(0), targ, slot: 0 });
-        let body = go(body, vars, nodes);
+        nodes.push(vec![PreElem::Fix { value: 0 }; 2]);
+        link(nodes, targ, 0, PreElem::Fix { value: rt::Era() });
+        if let Some(glob_name) = glob_name {
+          glob.insert(glob_name.clone(), PreElem::Loc { value: rt::Var(0), targ, slot: 0 });
+        }
+        vars.push(PreElem::Loc { value: rt::Var(0), targ, slot: 0 });
+        let body = gen_elem(body, glob, vars, nodes);
         link(nodes, targ, 1, body);
         vars.pop();
-        Elem::Loc { value: rt::Lam(0), targ, slot: 0 }
+        PreElem::Loc { value: rt::Lam(0), targ, slot: 0 }
       }
       DynTerm::App { func, argm } => {
         let targ = nodes.len() as u64;
-        nodes.push(vec![Elem::Fix { value: 0 }; 2]);
-        let func = go(func, vars, nodes);
+        nodes.push(vec![PreElem::Fix { value: 0 }; 2]);
+        let func = gen_elem(func, glob, vars, nodes);
         link(nodes, targ, 0, func);
-        let argm = go(argm, vars, nodes);
+        let argm = gen_elem(argm, glob, vars, nodes);
         link(nodes, targ, 1, argm);
-        Elem::Loc { value: rt::App(0), targ, slot: 0 }
+        PreElem::Loc { value: rt::App(0), targ, slot: 0 }
       }
       DynTerm::Cal { func, args } => {
         if !args.is_empty() {
           let targ = nodes.len() as u64;
-          nodes.push(vec![Elem::Fix { value: 0 }; args.len() as usize]);
+          nodes.push(vec![PreElem::Fix { value: 0 }; args.len() as usize]);
           for (i, arg) in args.iter().enumerate() {
-            let arg = go(arg, vars, nodes);
+            let arg = gen_elem(arg, glob, vars, nodes);
             link(nodes, targ, i as u64, arg);
           }
-          Elem::Loc { value: rt::Cal(args.len() as u64, *func, 0), targ, slot: 0 }
+          PreElem::Loc { value: rt::Cal(args.len() as u64, *func, 0), targ, slot: 0 }
         } else {
-          Elem::Fix { value: rt::Cal(0, *func, 0) }
+          PreElem::Fix { value: rt::Cal(0, *func, 0) }
         }
       }
       DynTerm::Ctr { func, args } => {
         if !args.is_empty() {
           let targ = nodes.len() as u64;
-          nodes.push(vec![Elem::Fix { value: 0 }; args.len() as usize]);
+          nodes.push(vec![PreElem::Fix { value: 0 }; args.len() as usize]);
           for (i, arg) in args.iter().enumerate() {
-            let arg = go(arg, vars, nodes);
+            let arg = gen_elem(arg, glob, vars, nodes);
             link(nodes, targ, i as u64, arg);
           }
-          Elem::Loc { value: rt::Ctr(args.len() as u64, *func, 0), targ, slot: 0 }
+          PreElem::Loc { value: rt::Ctr(args.len() as u64, *func, 0), targ, slot: 0 }
         } else {
-          Elem::Fix { value: rt::Ctr(0, *func, 0) }
+          PreElem::Fix { value: rt::Ctr(0, *func, 0) }
         }
       }
-      DynTerm::U32 { numb } => Elem::Fix { value: rt::U_32(*numb as u64) },
+      DynTerm::U32 { numb } => PreElem::Fix { value: rt::U_32(*numb as u64) },
       DynTerm::Op2 { oper, val0, val1 } => {
         let targ = nodes.len() as u64;
-        nodes.push(vec![Elem::Fix { value: 0 }; 2]);
-        let val0 = go(val0, vars, nodes);
+        nodes.push(vec![PreElem::Fix { value: 0 }; 2]);
+        let val0 = gen_elem(val0, glob, vars, nodes);
         link(nodes, targ, 0, val0);
-        let val1 = go(val1, vars, nodes);
+        let val1 = gen_elem(val1, glob, vars, nodes);
         link(nodes, targ, 1, val1);
-        Elem::Loc { value: rt::Op2(*oper, 0), targ, slot: 0 }
+        PreElem::Loc { value: rt::Op2(*oper, 0), targ, slot: 0 }
       }
     }
   }
+  fn make_elem(pre_elem: &PreElem, glob: &HashMap<String,PreElem>) -> Elem {
+    match pre_elem {
+      PreElem::Fix { value } => {
+        Elem::Fix {
+          value: *value
+        }
+      },
+      PreElem::Loc { value, targ, slot } => {
+        Elem::Loc {
+          value: *value,
+          targ: *targ,
+          slot: *slot
+        }
+      },
+      PreElem::Ext { index } => {
+        Elem::Ext {
+          index: *index
+        }
+      },
+      PreElem::Glo { name } => {
+        println!("Finding global: {}", name);
+        if let Some(got) = glob.get(name) {
+          println!("found!");
+          make_elem(got, glob)
+        } else {
+          panic!("Unbound variable: {}", name)
+        }
+      },
+    }
+  }
+  let mut pre_nodes: Vec<PreNode> = Vec::new();
+  let mut vars: Vec<PreElem> = (0..free_vars).map(|i| PreElem::Ext { index: i }).collect();
+  let mut glob: HashMap<String,PreElem> = HashMap::new();
+  let pre_elem = gen_elem(term, &mut glob, &mut vars, &mut pre_nodes);
   let mut nodes: Vec<Node> = Vec::new();
-  let mut vars: Vec<Elem> = (0..free_vars).map(|i| Elem::Ext { index: i }).collect();
-  let elem = go(term, &mut vars, &mut nodes);
-  (elem, nodes)
+  for pre_node in pre_nodes {
+    let mut node = Vec::new();
+    for pre_elem in pre_node {
+      node.push(make_elem(&pre_elem, &glob));
+    }
+    nodes.push(node);
+  }
+  (make_elem(&pre_elem, &glob), nodes)
 }
 
 static mut ALLOC_BODY_WORKSPACE: &mut [u64] = &mut [0; 256 * 256 * 256]; // to avoid dynamic allocations
